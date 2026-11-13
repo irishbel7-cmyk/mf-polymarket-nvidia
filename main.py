@@ -98,7 +98,16 @@ def _emp_spread(prices, h, window):
 
 def forecast_case(case):
     horizon = case.get("horizon_minutes", 240)
-    markets = case["markets"]
+    # Sanitise inputs: drop any non-finite price (a corrupt/missing tick in
+    # live data would otherwise poison the volatility estimate and the
+    # spreads with NaN). A no-op on clean data; a market left with no
+    # finite price falls through to the existing flat-0.5 branch below.
+    markets = []
+    for _m in case["markets"]:
+        _mm = dict(_m)
+        _mm["prices"] = [p for p in _m.get("prices", [])
+                         if isinstance(p, (int, float)) and math.isfinite(p)]
+        markets.append(_mm)
 
     # --- per-market volatility multiplier from the last VOL_WINDOW minutes ---
     mults = {}
