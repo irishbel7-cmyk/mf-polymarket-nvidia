@@ -1,190 +1,168 @@
 #!/usr/bin/env python3
-"""Forecast Polymarket's next NVIDIA CEO prices, minute by minute, 4 hours ahead.
+"""Forecast Polymarket's "Next CEO of NVIDIA?" Yes prices, 4 hours ahead.
 
-Entry for make.fun competition polymarket-nvidia-ceo-forecast-01 ($250).
-Python 3.13, standard library only, no network, deterministic.
+Method (per market, per case):
+  * Center: the most recent observed price (persistence, no drift).
+  * Volatility: standard deviation of the market's 15-minute price
+    changes over the last 120 minutes, expressed as a multiplier on the
+    baseline per-minute volatility of 0.0025, clipped to [0.1, 3.0].
+  * Spread at horizon h: the 15-minute volatility grown as
+    (h / 15) ** 0.30, so the spread widens slower than a random walk.
+  * Quantiles: center + z_tau * spread(h), with the standard normal
+    z-scores for 5/25/50/75/95%.
+  * Empirical blend: the spread of the market's prices over the last
+    24 hours (its 5-95% range, as a standard deviation) is scaled down
+    to each horizon the same way the model spread grows, and blended
+    0.8 * model spread + 0.2 * empirical spread. The interval stays
+    symmetric around the center, so the median is exactly the center.
+  * Clipped to [0, 1] and forced non-decreasing across the five levels.
 
-Method (re-derived in this session: the v2 experiment table and the
-neighbourhood sweep were re-run against the local scorer, which is
-built from Polymarket's public price history and reproduces the house
-baseline's published practice loss 0.363589 exactly):
-  - The house baseline says each price stays put with a spread widening
-    like a random walk: q = x + z_tau * 0.0025 * sqrt(h). It is well
-    calibrated for the calm regime the practice answers live in.
-  - This entry keeps that shape but scales it per market by RECENT
-    volatility: the last 120 minutes' 15-minute moves, relative to what
-    the baseline implies. The 72h history is dominated by the wild
-    market-discovery regime (Nov 10-11) and overstates current
-    volatility 2-5x; the last 2 hours track the live regime.
-  - The spread grows like h^0.30, not sqrt(h): 240-minute moves are far
-    smaller than random-walk extrapolation (mean reversion saturates
-    long-horizon variance). The rebuild sweep re-checked 0.28-0.40:
-    0.30 beats 0.35 on practice and on both 3-case halves.
-  - A 20% blend of the recent (24h) empirical move quantiles adds
-    jump-risk shape the normal curve misses.
-  - No drift: every drift tried (mean reversion to EWMA, cross-sectional
-    sum reversion) hurt on the practice cases.
-  - No Student-t fattening: the answers' tails are THINNER than normal
-    at these horizons; fattening hurt.
-
-Practice (local scorer, 6 cases): loss 0.289440 vs house baseline
-0.363589 (-20.4%); wins all 6 cases and both 3-case halves. On 12
-extra backtest windows from the wilder Nov 10-12 regime it also beats
-the baseline (2.195 vs 2.249), so it is not a calm-regime-only fit.
-(Rebuilt in a fresh post-opening session; the original build scored
-0.290475 at h^0.35, the revision to h^0.30 gained a further 0.001.)
-The practice score is no guide to the final (RULES.txt) - this is a
-generalising model, not a practice-fitted table: every parameter is
-estimated from each case's own history at run time.
+Reads every *.in file in $MAKEFUN_INPUT_DIR (default /input) and writes
+one *.out file per case to $MAKEFUN_OUTPUT_DIR (default /output).
+Standard library only, deterministic, no network.
 """
+
 import json
 import math
 import os
+import statistics
 import sys
+from pathlib import Path
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-
-QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
-
-BASE_SIGMA = 0.0025   # house baseline spread, price units per sqrt-minute
-VOL_WINDOW = 120      # minutes of recent history for the volatility multiplier
-VOL_HORIZON = 15      # move horizon for the volatility estimate
-MULT_CLIP = (0.1, 3.0)
-H_BETA = 0.30         # spread grows like h^0.30 (revised: the rebuild sweep
-                     # found 0.30 beats 0.35 on practice and on both 3-case
-                     # halves; extra-window robustness is a touch worse
-                     # but still beats the baseline by a wide margin)
-BLEND_EMP = 0.2       # weight of recent empirical move quantiles
-EMP_WINDOW = 1440     # minutes of history for the empirical quantiles
-H_GRID = (1, 2, 4, 8, 15, 30, 60, 120, 180, 240)
+# --- constants -----------------------------------------------------------
+BASE_SIGMA = 0.0025          # baseline per-minute volatility (house)
+VOL_WINDOW_MIN = 120         # minutes of history used for volatility
+VOL_STEP_MIN = 15            # spacing of the changes inside that window
+BETA = 0.30                  # spread growth exponent in horizon
+MULT_CLIP = (0.1, 3.0)       # clamp on the volatility multiplier
+EMP_WINDOW_MIN = 1440        # minutes of history for empirical quantiles
+EMP_BLEND = 0.2              # weight of the empirical quantiles
+HORIZON = 240                # minutes forecast ahead
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
+SQRT_15 = math.sqrt(15.0)
 
 
-def price6(x):
-    v = round(min(1.0, max(0.0, x)) * 1e6) / 1e6
-    return v + 0.0
+def finite_prices(prices):
+    """Keep only finite numbers (drop NaN/inf from a corrupt live tick)."""
+    out = []
+    for p in prices:
+        if isinstance(p, (int, float)) and math.isfinite(p):
+            out.append(float(p))
+    return out
 
 
-def _quantile(sorted_vals, tau):
+def sample_sd(values):
+    """Population standard deviation; 0.0 when fewer than two values."""
+    if len(values) < 2:
+        return 0.0
+    return statistics.pstdev(values)
+
+
+def interp_quantile(sorted_vals, level):
+    """Linear-interpolation quantile of a sorted list at `level` in [0, 1]."""
     n = len(sorted_vals)
     if n == 0:
-        return 0.0
+        return 0.5
     if n == 1:
         return sorted_vals[0]
-    pos = tau * (n - 1)
+    pos = level * (n - 1)
     lo = int(math.floor(pos))
     hi = min(lo + 1, n - 1)
     frac = pos - lo
-    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
-def _sd(vals):
-    n = len(vals)
-    if n < 2:
-        return 0.0
-    m = sum(vals) / n
-    return (sum((v - m) ** 2 for v in vals) / n) ** 0.5
+def volatility_multiplier(clean):
+    """Per-market volatility multiplier from the last 120 minutes.
+
+    Takes the price changes over 15-minute intervals within the last
+    120 minutes (every minute's 15-minute change, overlapping) and
+    divides their standard deviation by the baseline 15-minute
+    standard deviation (0.0025 * sqrt(15)). Clipped to [0.1, 3.0];
+    1.0 when there is not enough history to measure a change.
+    """
+    changes = []
+    # every minute's 15-minute change over the last 120 minutes
+    start = max(VOL_STEP_MIN, len(clean) - VOL_WINDOW_MIN)
+    for i in range(start, len(clean)):
+        changes.append(clean[i] - clean[i - VOL_STEP_MIN])
+    sd15 = sample_sd(changes)
+    if sd15 <= 0.0:
+        return 1.0
+    mult = sd15 / (BASE_SIGMA * SQRT_15)
+    if mult < MULT_CLIP[0]:
+        return MULT_CLIP[0]
+    if mult > MULT_CLIP[1]:
+        return MULT_CLIP[1]
+    return mult
 
 
-def _emp_spread(prices, h, window):
-    pr = prices[-window:] if len(prices) > window else prices
-    n = len(pr)
-    if n - h < 20:
-        return None
-    moves = sorted(pr[i + h] - pr[i] for i in range(n - h))
-    return [_quantile(moves, t) for t in QUANTILES]
+def empirical_quantiles(clean):
+    """Quantiles of the last 24 hours of prices at the five levels."""
+    window = clean[-EMP_WINDOW_MIN:]
+    ordered = sorted(window)
+    return [interp_quantile(ordered, lv) for lv in LEVELS]
+
+
+def forecast_market(prices):
+    """Return the 240 x 5 forecast rows for one market."""
+    clean = finite_prices(prices)
+    if not clean:
+        return [[0.5, 0.5, 0.5, 0.5, 0.5] for _ in range(HORIZON)]
+    center = clean[-1]
+    mult = volatility_multiplier(clean)
+    emp = empirical_quantiles(clean)
+    # empirical spread implied by the 24h 5-95% range, blended with the
+    # model spread; the interval stays symmetric around the center, so
+    # the median is exactly the center. The empirical spread is scaled
+    # down to the horizon the same way the model spread grows.
+    emp_spread = (emp[4] - emp[0]) / (2.0 * 1.644854)
+    sigma15 = BASE_SIGMA * mult * SQRT_15
+    rows = []
+    for h in range(1, HORIZON + 1):
+        spread = sigma15 * (h / float(VOL_STEP_MIN)) ** BETA
+        emp_h = emp_spread * (h / float(EMP_WINDOW_MIN)) ** BETA
+        blended_spread = (1.0 - EMP_BLEND) * spread + EMP_BLEND * emp_h
+        row = []
+        for qi in range(len(LEVELS)):
+            row.append(center + Z_SCORES[qi] * blended_spread)
+        # clip to [0, 1] and force non-decreasing across the levels
+        row = [min(1.0, max(0.0, v)) for v in row]
+        for qi in range(1, len(row)):
+            if row[qi] < row[qi - 1]:
+                row[qi] = row[qi - 1]
+        rows.append([round(v, 6) for v in row])
+    return rows
 
 
 def forecast_case(case):
-    horizon = case.get("horizon_minutes", 240)
-    # Sanitise inputs: drop any non-finite price (a corrupt/missing tick in
-    # live data would otherwise poison the volatility estimate and the
-    # spreads with NaN). A no-op on clean data; a market left with no
-    # finite price falls through to the existing flat-0.5 branch below.
-    markets = []
-    for _m in case["markets"]:
-        _mm = dict(_m)
-        _mm["prices"] = [p for p in _m.get("prices", [])
-                         if isinstance(p, (int, float)) and math.isfinite(p)]
-        markets.append(_mm)
-
-    # --- per-market volatility multiplier from the last VOL_WINDOW minutes ---
-    mults = {}
-    for m in markets:
-        pr = m["prices"]
-        rec = pr[-VOL_WINDOW:] if len(pr) > VOL_WINDOW else pr
-        if len(rec) - VOL_HORIZON >= 60:
-            rv = _sd([rec[i + VOL_HORIZON] - rec[i]
-                      for i in range(len(rec) - VOL_HORIZON)])
-            mm = rv / (BASE_SIGMA * math.sqrt(VOL_HORIZON))
-            mm = max(MULT_CLIP[0], min(MULT_CLIP[1], mm))
-            mults[m["id"]] = mm
-        else:
-            mults[m["id"]] = None
-    # pooled multiplier (median) for markets too young to estimate their own
-    known = sorted(v for v in mults.values() if v is not None)
-    pooled = known[len(known) // 2] if known else 1.0
-
+    """Forecast one case dict; return the output object."""
     forecasts = []
-    for m in markets:
-        pr = m["prices"]
-        if not pr:  # degenerate case: emit a valid flat forecast, never crash
-            rows = [[0.5] * 5 for _ in range(horizon)]
-            forecasts.append({"id": m["id"], "q": rows})
-            continue
-        x = pr[-1]
-        mm = mults[m["id"]] if mults[m["id"]] is not None else pooled
-        # recent empirical move quantiles (for the 20% blend)
-        emp_grid = {}
-        for h in H_GRID:
-            if h > horizon:
-                continue
-            q = _emp_spread(pr, h, EMP_WINDOW)
-            if q is not None:
-                emp_grid[h] = q
-        rows = []
-        for h in range(1, horizon + 1):
-            sig_h = BASE_SIGMA * mm * (15.0 ** 0.5) * ((h / 15.0) ** H_BETA)
-            spread = [Z[j] * sig_h for j in range(5)]
-            if emp_grid:
-                hs = sorted(emp_grid)
-                if h <= hs[0]:
-                    emp = emp_grid[hs[0]]
-                elif h >= hs[-1]:
-                    emp = emp_grid[hs[-1]]
-                else:
-                    emp = None
-                    for a, b in zip(hs, hs[1:]):
-                        if a <= h <= b:
-                            wa = (math.sqrt(b) - math.sqrt(h)) / (math.sqrt(b) - math.sqrt(a))
-                            emp = [wa * emp_grid[a][j] + (1 - wa) * emp_grid[b][j]
-                                   for j in range(5)]
-                            break
-                if emp is not None:
-                    w = BLEND_EMP
-                    spread = [w * (emp[j] - emp[2]) + (1 - w) * spread[j]
-                              for j in range(5)]
-            row = [price6(x + spread[j]) for j in range(5)]
-            for j in range(1, 5):
-                if row[j] < row[j - 1]:
-                    row[j] = row[j - 1]
-            rows.append(row)
-        forecasts.append({"id": m["id"], "q": rows})
+    for market in case["markets"]:
+        rows = forecast_market(market["prices"])
+        forecasts.append({"id": market["id"], "q": rows})
     return {"forecasts": forecasts}
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    inputs = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    for fn in inputs:
-        with open(os.path.join(INPUT_DIR, fn), "r", encoding="utf-8") as f:
+    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    in_files = sorted(in_dir.glob("*.in"))
+    if not in_files:
+        print("no .in files in %s" % in_dir, file=sys.stderr)
+        return 1
+    for in_file in in_files:
+        with open(in_file, "r", encoding="utf-8") as f:
             case = json.load(f)
-        out = forecast_case(case)
-        out_path = os.path.join(OUTPUT_DIR, fn[:-3] + ".out")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(out, separators=(",", ":")) + "\n")
+        result = forecast_case(case)
+        out_file = out_dir / (in_file.stem + ".out")
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, separators=(",", ":"), sort_keys=True)
+            f.write("\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
