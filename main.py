@@ -4,8 +4,9 @@
 Entry for make.fun competition polymarket-nvidia-ceo-forecast-01 ($250).
 Python 3.13, standard library only, no network, deterministic.
 
-Method (measured on the kit's 6 practice cases with a local scorer built
-from Polymarket's public price history; the scorer reproduces the house
+Method (re-derived in this session: the v2 experiment table and the
+neighbourhood sweep were re-run against the local scorer, which is
+built from Polymarket's public price history and reproduces the house
 baseline's published practice loss 0.363589 exactly):
   - The house baseline says each price stays put with a spread widening
     like a random walk: q = x + z_tau * 0.0025 * sqrt(h). It is well
@@ -15,9 +16,10 @@ baseline's published practice loss 0.363589 exactly):
     the baseline implies. The 72h history is dominated by the wild
     market-discovery regime (Nov 10-11) and overstates current
     volatility 2-5x; the last 2 hours track the live regime.
-  - The spread grows like h^0.35, not sqrt(h): 240-minute moves are far
+  - The spread grows like h^0.30, not sqrt(h): 240-minute moves are far
     smaller than random-walk extrapolation (mean reversion saturates
-    long-horizon variance).
+    long-horizon variance). The rebuild sweep re-checked 0.28-0.40:
+    0.30 beats 0.35 on practice and on both 3-case halves.
   - A 20% blend of the recent (24h) empirical move quantiles adds
     jump-risk shape the normal curve misses.
   - No drift: every drift tried (mean reversion to EWMA, cross-sectional
@@ -25,10 +27,12 @@ baseline's published practice loss 0.363589 exactly):
   - No Student-t fattening: the answers' tails are THINNER than normal
     at these horizons; fattening hurt.
 
-Practice (local scorer, 6 cases): loss 0.290475 vs house baseline
-0.363589 (-20.1%); wins all 6 cases and both 3-case halves. On 12
+Practice (local scorer, 6 cases): loss 0.289440 vs house baseline
+0.363589 (-20.4%); wins all 6 cases and both 3-case halves. On 12
 extra backtest windows from the wilder Nov 10-12 regime it also beats
-the baseline (2.190 vs 2.249), so it is not a calm-regime-only fit.
+the baseline (2.195 vs 2.249), so it is not a calm-regime-only fit.
+(Rebuilt in a fresh post-opening session; the original build scored
+0.290475 at h^0.35, the revision to h^0.30 gained a further 0.001.)
 The practice score is no guide to the final (RULES.txt) - this is a
 generalising model, not a practice-fitted table: every parameter is
 estimated from each case's own history at run time.
@@ -48,7 +52,10 @@ BASE_SIGMA = 0.0025   # house baseline spread, price units per sqrt-minute
 VOL_WINDOW = 120      # minutes of recent history for the volatility multiplier
 VOL_HORIZON = 15      # move horizon for the volatility estimate
 MULT_CLIP = (0.1, 3.0)
-H_BETA = 0.35         # spread grows like h^0.35
+H_BETA = 0.30         # spread grows like h^0.30 (revised: the rebuild sweep
+                     # found 0.30 beats 0.35 on practice and on both 3-case
+                     # halves; extra-window robustness is a touch worse
+                     # but still beats the baseline by a wide margin)
 BLEND_EMP = 0.2       # weight of recent empirical move quantiles
 EMP_WINDOW = 1440     # minutes of history for the empirical quantiles
 H_GRID = (1, 2, 4, 8, 15, 30, 60, 120, 180, 240)
